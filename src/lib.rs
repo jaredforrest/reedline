@@ -282,6 +282,9 @@ pub use highlighter::{AbbrExpandContext, ExampleHighlighter, Highlighter, Simple
 mod completion;
 pub use completion::{Completer, DefaultCompleter, Span, Suggestion};
 
+mod abbreviation;
+pub use abbreviation::{AbbreviationExpansion, AbbreviationTrigger, Abbreviator};
+
 mod hinter;
 pub use hinter::CwdAwareHinter;
 pub use hinter::{DefaultHinter, Hinter};

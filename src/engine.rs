@@ -9,6 +9,7 @@ use crate::{
     history::SearchFilter,
     menu_functions::{parse_selection_char, ParseAction},
 };
+use unicode_segmentation::UnicodeSegmentation;
 #[cfg(feature = "external_printer")]
 use {
     crate::external_printer::ExternalPrinter,
@@ -36,9 +37,9 @@ use {
             semantic_prompt::{Osc133ClickEventsMarkers, SemanticPromptMarkers},
         },
         utils::text_manipulation,
-        AbbrExpandContext, EditCommand, ExampleHighlighter, Highlighter, LineBuffer, Menu,
-        MenuEvent, MouseButton, Prompt, PromptHistorySearch, ReedlineMenu, Signal, UndoBehavior,
-        ValidationResult, Validator,
+        AbbrExpandContext, AbbreviationTrigger, EditCommand, ExampleHighlighter, Highlighter,
+        LineBuffer, Menu, MenuEvent, MouseButton, Prompt, PromptHistorySearch, ReedlineMenu,
+        Signal, UndoBehavior, ValidationResult, Validator,
     },
     crossterm::{
         cursor::{SetCursorStyle, Show},
@@ -189,6 +190,9 @@ pub struct Reedline {
 
     abbreviations: HashMap<String, String>,
 
+    // Optional parser-aware fish-style abbreviation expander.
+    abbreviator: Option<Box<dyn crate::Abbreviator>>,
+
     // Text editor used to open the line buffer for editing
     buffer_editor: Option<BufferEditor>,
 
@@ -293,6 +297,7 @@ impl Reedline {
             cwd: None,
             menus: Vec::new(),
             abbreviations: HashMap::new(),
+            abbreviator: None,
             buffer_editor: None,
             cursor_shapes: None,
             bracketed_paste: BracketedPasteGuard::default(),
@@ -625,12 +630,23 @@ impl Reedline {
         self
     }
 
-    /// A builder that adds abbreviations to the Reedline engine
+    /// A builder that configures parser-aware abbreviation expansion.
     ///
-    /// Overwrites any existing abbreviations with the same key.
+    /// Use this when the shell needs to choose its own replacement range or
+    /// cursor placement. Simple maps should use [`Self::with_abbreviations`].
+    /// When set, this takes precedence over simple map abbreviations.
+    #[must_use]
+    pub fn with_abbreviator(mut self, abbreviator: Box<dyn crate::Abbreviator>) -> Self {
+        self.abbreviator = Some(abbreviator);
+        self
+    }
+
+    /// A builder that adds simple position-agnostic abbreviations.
     ///
-    /// Note, by default abbreviations are expanded everywhere. To suppress expansion in certain
-    /// syntactic positions (e.g. string literals), override [`Highlighter::should_expand_abbr`].
+    /// Multiple calls extend the map, preserving the historical behavior that
+    /// later entries override earlier entries with the same key.
+    /// Shells that need parser-aware behavior should use [`Self::with_abbreviator`].
+    #[must_use]
     pub fn with_abbreviations(mut self, abbreviations: HashMap<String, String>) -> Self {
         self.abbreviations.extend(abbreviations);
         self
@@ -1291,9 +1307,8 @@ impl Reedline {
                 if let Some(event) = self.parse_bang_command() {
                     return self.handle_editor_event(prompt, event);
                 }
-                if let Some(event) = self.try_expand_abbreviation_at_cursor(true) {
-                    self.handle_editor_event(prompt, event)?;
-                }
+
+                self.expand_word_abbreviation(AbbreviationTrigger::Submit);
 
                 let buffer = self.editor.get_buffer().to_string();
                 match self.validator.as_mut().map(|v| v.validate(&buffer)) {
@@ -1310,9 +1325,8 @@ impl Reedline {
                 if let Some(event) = self.parse_bang_command() {
                     return self.handle_editor_event(prompt, event);
                 }
-                if let Some(event) = self.try_expand_abbreviation_at_cursor(true) {
-                    self.handle_editor_event(prompt, event)?;
-                }
+
+                self.expand_word_abbreviation(AbbreviationTrigger::Submit);
 
                 Ok(self.submit_buffer(prompt)?)
             }
@@ -1321,9 +1335,6 @@ impl Reedline {
                 if let Some(event) = self.parse_bang_command() {
                     return self.handle_editor_event(prompt, event);
                 }
-                if let Some(event) = self.try_expand_abbreviation_at_cursor(true) {
-                    self.handle_editor_event(prompt, event)?;
-                }
 
                 let cursor_position_in_buffer = self.editor.insertion_point();
                 let buffer = self.editor.get_buffer().to_string();
@@ -1331,6 +1342,10 @@ impl Reedline {
                     self.run_edit_commands(&[EditCommand::InsertNewline]);
                     return Ok(EventStatus::Handled);
                 }
+
+                self.expand_word_abbreviation(AbbreviationTrigger::Submit);
+
+                let buffer = self.editor.get_buffer().to_string();
                 match self.validator.as_mut().map(|v| v.validate(&buffer)) {
                     None | Some(ValidationResult::Complete) => Ok(self.submit_buffer(prompt)?),
                     Some(ValidationResult::Incomplete) => {
@@ -1347,12 +1362,6 @@ impl Reedline {
             }
             ReedlineEvent::Edit(commands) => {
                 self.run_edit_commands(&commands);
-                // Check if a space was just inserted and try to expand abbreviations
-                if let Some(EditCommand::InsertChar(' ')) = commands.first() {
-                    if let Some(event) = self.try_expand_abbreviation_at_cursor(false) {
-                        return self.handle_editor_event(prompt, event);
-                    }
-                }
                 if let Some(menu) = self.menus.iter_mut().find(|men| men.is_active()) {
                     if self.quick_completions && menu.can_quick_complete() {
                         match commands.first() {
@@ -1720,6 +1729,23 @@ impl Reedline {
 
         // Run the commands over the edit buffer
         for command in commands {
+            // Fish-style abbreviation expansion: when the user types Space,
+            // check if the word before the cursor matches a known abbreviation
+            // and replace it with the expansion before inserting the space.
+            if let EditCommand::InsertChar(' ') = command {
+                // Only expand abbreviations when no completion menu is active;
+                // expanding while a menu is open could corrupt the buffer and
+                // interfere with menu navigation.
+                if !self.menus.iter().any(|m| m.is_active()) {
+                    // When an abbreviation expands, it handles the Space keypress
+                    // itself so the original literal space should not be inserted.
+                    let space_consumed = self.expand_word_abbreviation(AbbreviationTrigger::Space);
+                    if !space_consumed {
+                        self.editor.run_edit_command(command);
+                    }
+                    continue;
+                }
+            }
             self.editor.run_edit_command(command);
         }
     }
@@ -1759,59 +1785,78 @@ impl Reedline {
         }
     }
 
-    /// Expands an abbreviation at the word before the cursor, if any exists
+    /// Expand the token at the cursor using the configured abbreviator.
     ///
-    /// Calls [`Highlighter::should_expand_abbr`] with [`AbbrExpandContext::WordAbbreviation`]
-    /// to decide whether expansion is permitted at the cursor position
-    fn try_expand_abbreviation_at_cursor(&mut self, submitted: bool) -> Option<ReedlineEvent> {
-        let buffer = self.editor.get_buffer();
-        let cursor_position_in_buffer = self.editor.insertion_point();
-        if cursor_position_in_buffer == 0 {
-            return None;
+    /// Expands the token immediately before the cursor. On a match the
+    /// replacement is applied as a single undo step via
+    /// [`UndoBehavior::CreateUndoPoint`]. Returns `true` when the trigger was
+    /// handled by an expansion, `false` when there is no match.
+    fn expand_word_abbreviation(&mut self, trigger: AbbreviationTrigger) -> bool {
+        let buf = self.editor.line_buffer().get_buffer();
+        let insertion_point = self.editor.line_buffer().insertion_point();
+        if !buf.is_char_boundary(insertion_point) {
+            return false;
         }
 
-        let (offset, suffix) = match submitted {
-            true => (0, ""),   // expand on <enter>
-            false => (1, " "), // expand on <space>
+        let expansion = match if let Some(abbreviator) = self.abbreviator.as_deref() {
+            abbreviator.expand_at_cursor(buf, insertion_point, trigger)
+        } else {
+            crate::Abbreviator::expand_at_cursor(&self.abbreviations, buf, insertion_point, trigger)
+        } {
+            Some(expansion) => expansion,
+            None => return false,
         };
 
-        let word_end = cursor_position_in_buffer - offset;
-        let prefix = &buffer[..word_end];
-        let word_start = prefix
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| ch.is_whitespace())
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0); // byte offset of word start
-
-        if word_start >= word_end {
-            // The first char in the buffer is a space or there are consecutive spaces
-            return None;
+        if expansion.replace_range.end != insertion_point
+            || expansion.replace_range.start > expansion.replace_range.end
+            || expansion.replace_range.end > buf.len()
+            || !buf.is_char_boundary(expansion.replace_range.start)
+            || !buf.is_char_boundary(expansion.replace_range.end)
+        {
+            return false;
         }
+
+        if expansion.replace_range.is_empty() {
+            return false;
+        }
+
         if !self.highlighter.should_expand_abbr(
-            buffer,
-            word_start,
+            buf,
+            expansion.replace_range.start,
             AbbrExpandContext::WordAbbreviation,
         ) {
-            return None;
+            return false;
         }
 
-        let word = &buffer[word_start..word_end];
-        if let Some(expansion) = self.abbreviations.get(word) {
-            return Some(ReedlineEvent::Edit(vec![
-                EditCommand::MoveToPosition {
-                    position: word_start,
-                    select: false,
-                },
-                EditCommand::MoveToPosition {
-                    position: word_end,
-                    select: true,
-                },
-                EditCommand::InsertString(format!("{}{}", expansion, suffix)),
-            ]));
+        if let Some(marker_offset) = expansion.cursor {
+            let is_grapheme_boundary = marker_offset == expansion.replacement.len()
+                || expansion
+                    .replacement
+                    .grapheme_indices(true)
+                    .any(|(index, _)| index == marker_offset);
+            if !is_grapheme_boundary {
+                return false;
+            }
         }
 
-        None
+        let new_cursor = if let Some(marker_offset) = expansion.cursor {
+            expansion.replace_range.start + marker_offset
+        } else {
+            expansion.replace_range.start + expansion.replacement.len()
+        };
+        let new_buf = format!(
+            "{}{}{}",
+            &buf[..expansion.replace_range.start],
+            expansion.replacement,
+            &buf[expansion.replace_range.end..]
+        );
+
+        let mut line_buffer = self.editor.line_buffer().clone();
+        line_buffer.set_buffer(new_buf);
+        line_buffer.set_insertion_point(new_cursor);
+        self.editor
+            .set_line_buffer(line_buffer, UndoBehavior::CreateUndoPoint);
+        true
     }
 
     #[cfg(feature = "bashisms")]
@@ -2271,6 +2316,7 @@ mod tests {
     use crate::terminal_extensions::semantic_prompt::PromptKind;
     use crate::DefaultPrompt;
     use rstest::rstest;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn reedline_is_send() {
@@ -2463,16 +2509,6 @@ mod tests {
         }
     }
 
-    fn reedline_with_abbrevs_and_string_lit_override(abbrevs: &[(&str, &str)]) -> Reedline {
-        let map = abbrevs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        Reedline::create()
-            .with_highlighter(Box::new(ExampleHighlighter::default()))
-            .with_abbreviations(map)
-    }
-
     fn reedline_with_abbrevs_and_default_string_lit_check(abbrevs: &[(&str, &str)]) -> Reedline {
         let map = abbrevs
             .iter()
@@ -2483,6 +2519,16 @@ mod tests {
             .with_abbreviations(map)
     }
 
+    fn reedline_with_abbrevs_and_string_lit_override(abbrevs: &[(&str, &str)]) -> Reedline {
+        let map = abbrevs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        Reedline::create()
+            .with_highlighter(Box::new(ExampleHighlighter::default()))
+            .with_abbreviations(map)
+    }
+
     fn set_buffer_at_end(reedline: &mut Reedline, text: &str) {
         reedline.run_edit_commands(&[
             EditCommand::Clear,
@@ -2490,47 +2536,133 @@ mod tests {
         ]);
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct AbbreviatorCall {
+        line: String,
+        cursor: usize,
+    }
+
+    struct RecordingAbbreviator {
+        calls: Arc<Mutex<Vec<AbbreviatorCall>>>,
+        expansion: Option<crate::AbbreviationExpansion>,
+    }
+
+    impl crate::Abbreviator for RecordingAbbreviator {
+        fn expand_at_cursor(
+            &self,
+            line: &str,
+            cursor: usize,
+            _trigger: AbbreviationTrigger,
+        ) -> Option<crate::AbbreviationExpansion> {
+            self.calls.lock().unwrap().push(AbbreviatorCall {
+                line: line.to_string(),
+                cursor,
+            });
+            self.expansion.clone()
+        }
+    }
+
+    struct IncompleteExpandedCommandValidator;
+
+    impl Validator for IncompleteExpandedCommandValidator {
+        fn validate(&self, line: &str) -> ValidationResult {
+            if line == "git commit -m \"" {
+                ValidationResult::Incomplete
+            } else {
+                ValidationResult::Complete
+            }
+        }
+    }
+
     #[test]
-    fn abbreviation_expands_on_submit() {
+    fn abbreviation_expands_on_space() {
         let mut reedline =
             reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
         set_buffer_at_end(&mut reedline, "gc");
-        let event = reedline.try_expand_abbreviation_at_cursor(true);
-        assert!(event.is_some(), "expected expansion on submit");
-        reedline.run_edit_commands(&match event.unwrap() {
-            ReedlineEvent::Edit(cmds) => cmds,
-            _ => panic!("expected Edit event"),
-        });
-        assert_eq!(reedline.current_buffer_contents(), "git commit");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "git commit ");
     }
 
     #[test]
-    fn abbreviation_no_match_returns_none() {
+    fn abbreviation_redo_restores_expansion() {
         let mut reedline =
             reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
-        set_buffer_at_end(&mut reedline, "gx");
-        assert!(reedline.try_expand_abbreviation_at_cursor(true).is_none());
+        set_buffer_at_end(&mut reedline, "gc");
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        reedline.run_edit_commands(&[EditCommand::Undo]);
+        assert_eq!(reedline.current_buffer_contents(), "gc");
+
+        reedline.run_edit_commands(&[EditCommand::Redo]);
+        assert_eq!(reedline.current_buffer_contents(), "git commit ");
     }
 
     #[test]
-    fn abbreviation_empty_buffer_returns_none() {
-        let mut reedline =
-            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
-        assert!(reedline.try_expand_abbreviation_at_cursor(true).is_none());
+    fn abbreviation_expands_with_hash_map_builder() {
+        let mut reedline = Reedline::create().with_abbreviations(std::collections::HashMap::from(
+            [("gc".to_string(), "git commit".to_string())],
+        ));
+        set_buffer_at_end(&mut reedline, "gc");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "git commit ");
     }
 
     #[test]
-    fn abbreviation_expands_last_word_only() {
+    fn abbreviation_hash_map_builder_extends_with_later_overrides() {
+        let mut reedline = Reedline::create()
+            .with_abbreviations(std::collections::HashMap::from([
+                ("gc".to_string(), "git commit".to_string()),
+                ("gs".to_string(), "git status".to_string()),
+            ]))
+            .with_abbreviations(std::collections::HashMap::from([
+                ("gc".to_string(), "git checkout".to_string()),
+                ("ga".to_string(), "git add".to_string()),
+            ]));
+
+        set_buffer_at_end(&mut reedline, "gs");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "git status ");
+
+        set_buffer_at_end(&mut reedline, "gc");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "git checkout ");
+
+        set_buffer_at_end(&mut reedline, "ga");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "git add ");
+    }
+
+    #[test]
+    fn abbreviation_expands_on_submit_without_trailing_space() {
         let mut reedline =
             reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
-        set_buffer_at_end(&mut reedline, "sudo gc");
-        let event = reedline.try_expand_abbreviation_at_cursor(true);
-        assert!(event.is_some());
-        reedline.run_edit_commands(&match event.unwrap() {
-            ReedlineEvent::Edit(cmds) => cmds,
-            _ => panic!("expected Edit event"),
-        });
-        assert_eq!(reedline.current_buffer_contents(), "sudo git commit");
+        let prompt = DefaultPrompt::default();
+        set_buffer_at_end(&mut reedline, "gc");
+
+        let event = reedline
+            .handle_event(&prompt, ReedlineEvent::Submit)
+            .unwrap();
+
+        assert!(matches!(
+            event,
+            EventStatus::Exits(Signal::Success(buffer)) if buffer == "git commit"
+        ));
+    }
+
+    #[test]
+    fn abbreviation_expands_before_enter_validation() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gcm", "git commit -m \"")])
+                .with_validator(Box::new(IncompleteExpandedCommandValidator));
+        let prompt = DefaultPrompt::default();
+        set_buffer_at_end(&mut reedline, "gcm");
+
+        let event = reedline
+            .handle_event(&prompt, ReedlineEvent::Enter)
+            .unwrap();
+
+        assert!(matches!(event, EventStatus::Handled));
+        assert_eq!(reedline.current_buffer_contents(), "git commit -m \"\n");
     }
 
     #[rstest]
@@ -2541,16 +2673,60 @@ mod tests {
     #[case("'Сегодня' gc", true)]
     #[case("'今日はいい日だ gc", false)]
     #[case("'🔥🎉 gc", false)]
-    fn abbreviation_string_detection_with_override(
-        #[case] buffer: &str,
-        #[case] should_expand: bool,
-    ) {
+    fn abbreviation_respects_highlighter_veto(#[case] buffer: &str, #[case] should_expand: bool) {
         let mut reedline = reedline_with_abbrevs_and_string_lit_override(&[("gc", "git commit")]);
         set_buffer_at_end(&mut reedline, buffer);
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
         assert_eq!(
-            reedline.try_expand_abbreviation_at_cursor(true).is_some(),
+            reedline.current_buffer_contents().ends_with("git commit "),
             should_expand
         );
+    }
+
+    #[test]
+    fn abbreviation_submit_or_newline_does_not_expand_mid_buffer() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
+        let prompt = DefaultPrompt::default();
+        reedline
+            .editor
+            .set_buffer("gc | str length".to_string(), UndoBehavior::CreateUndoPoint);
+        reedline
+            .editor
+            .edit_buffer(|buf| buf.set_insertion_point(2), UndoBehavior::MoveCursor);
+
+        let event = reedline
+            .handle_event(&prompt, ReedlineEvent::SubmitOrNewline)
+            .unwrap();
+
+        assert!(matches!(event, EventStatus::Handled));
+        assert_eq!(reedline.current_buffer_contents(), "gc\n | str length");
+    }
+
+    #[test]
+    fn abbreviation_no_match_no_expansion() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
+        set_buffer_at_end(&mut reedline, "gx");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "gx ");
+    }
+
+    #[test]
+    fn abbreviation_empty_buffer_no_expansion() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), " ");
+    }
+
+    #[test]
+    fn abbreviation_expands_last_word_only() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
+        set_buffer_at_end(&mut reedline, "sudo gc");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "sudo git commit ");
     }
 
     #[rstest]
@@ -2565,9 +2741,10 @@ mod tests {
         let mut reedline =
             reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
         set_buffer_at_end(&mut reedline, buffer);
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
         assert!(
-            reedline.try_expand_abbreviation_at_cursor(true).is_some(),
-            "must expand when highlighter does not override should_expand_abbr"
+            reedline.current_buffer_contents().ends_with("git commit "),
+            "must expand when highlighter does not override is_inside_string_literal"
         );
     }
 
@@ -2576,21 +2753,65 @@ mod tests {
         let mut reedline =
             reedline_with_abbrevs_and_default_string_lit_check(&[("café", "coffee shop")]);
         set_buffer_at_end(&mut reedline, "café");
-        let event = reedline.try_expand_abbreviation_at_cursor(true);
-        assert!(event.is_some(), "expected expansion for non-ASCII key");
-        reedline.run_edit_commands(&match event.unwrap() {
-            ReedlineEvent::Edit(cmds) => cmds,
-            _ => panic!("expected Edit event"),
-        });
-        assert_eq!(reedline.current_buffer_contents(), "coffee shop");
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "coffee shop ");
     }
 
     #[test]
-    fn abbreviation_leading_spaces_returns_none() {
+    fn abbreviation_leading_spaces_no_expansion() {
         let mut reedline =
             reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
         set_buffer_at_end(&mut reedline, "   ");
-        assert!(reedline.try_expand_abbreviation_at_cursor(true).is_none());
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+        assert_eq!(reedline.current_buffer_contents(), "    ");
+    }
+
+    #[test]
+    fn abbreviation_does_not_expand_token_after_cursor() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
+        reedline
+            .editor
+            .set_buffer("gc".to_string(), UndoBehavior::CreateUndoPoint);
+        reedline
+            .editor
+            .edit_buffer(|buf| buf.set_insertion_point(0), UndoBehavior::MoveCursor);
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), " gc");
+    }
+
+    #[test]
+    fn abbreviation_does_not_expand_inside_token() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
+        reedline
+            .editor
+            .set_buffer("gcmain".to_string(), UndoBehavior::CreateUndoPoint);
+        reedline
+            .editor
+            .edit_buffer(|buf| buf.set_insertion_point(2), UndoBehavior::MoveCursor);
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), "gc main");
+    }
+
+    #[test]
+    fn abbreviation_preserves_typed_space_before_boundary() {
+        let mut reedline =
+            reedline_with_abbrevs_and_default_string_lit_check(&[("gc", "git commit")]);
+        reedline
+            .editor
+            .set_buffer("gc|main".to_string(), UndoBehavior::CreateUndoPoint);
+        reedline
+            .editor
+            .edit_buffer(|buf| buf.set_insertion_point(2), UndoBehavior::MoveCursor);
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), "git commit |main");
     }
 
     #[cfg(feature = "bashisms")]
@@ -2653,5 +2874,128 @@ mod tests {
             reedline.parse_bang_command().is_some(),
             "must expand when highlighter does not override should_expand_abbr"
         );
+    }
+
+    #[test]
+    fn custom_abbreviator_receives_line_and_cursor() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reedline = Reedline::create().with_abbreviator(Box::new(RecordingAbbreviator {
+            calls: calls.clone(),
+            expansion: Some(crate::AbbreviationExpansion {
+                replace_range: 5..7,
+                replacement: "git checkout ".to_string(),
+                cursor: None,
+            }),
+        }));
+        reedline
+            .editor
+            .set_buffer("sudo gc|main".to_string(), UndoBehavior::CreateUndoPoint);
+        reedline
+            .editor
+            .edit_buffer(|buf| buf.set_insertion_point(7), UndoBehavior::MoveCursor);
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(
+            reedline.current_buffer_contents(),
+            "sudo git checkout |main"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![AbbreviatorCall {
+                line: "sudo gc|main".to_string(),
+                cursor: 7,
+            }]
+        );
+    }
+
+    #[test]
+    fn custom_abbreviator_can_decline_expansion() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reedline = Reedline::create().with_abbreviator(Box::new(RecordingAbbreviator {
+            calls: calls.clone(),
+            expansion: None,
+        }));
+        set_buffer_at_end(&mut reedline, "gc");
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), "gc ");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn custom_abbreviator_decline_does_not_fall_back_to_hash_map() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reedline = Reedline::create()
+            .with_abbreviations(std::collections::HashMap::from([(
+                "gc".to_string(),
+                "git commit".to_string(),
+            )]))
+            .with_abbreviator(Box::new(RecordingAbbreviator {
+                calls: calls.clone(),
+                expansion: None,
+            }));
+        set_buffer_at_end(&mut reedline, "gc");
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), "gc ");
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn custom_abbreviator_can_place_cursor_inside_expansion() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reedline = Reedline::create().with_abbreviator(Box::new(RecordingAbbreviator {
+            calls,
+            expansion: Some(crate::AbbreviationExpansion {
+                replace_range: 0..3,
+                replacement: "git commit -m \"\"".to_string(),
+                cursor: Some(15),
+            }),
+        }));
+        set_buffer_at_end(&mut reedline, "gcm");
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), "git commit -m \"\"");
+        assert_eq!(reedline.current_insertion_point(), 15);
+    }
+
+    #[test]
+    fn custom_abbreviator_invalid_cursor_offset_declines_expansion() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reedline = Reedline::create().with_abbreviator(Box::new(RecordingAbbreviator {
+            calls,
+            expansion: Some(crate::AbbreviationExpansion {
+                replace_range: 0..2,
+                replacement: "git commit".to_string(),
+                cursor: Some(100),
+            }),
+        }));
+        set_buffer_at_end(&mut reedline, "gc");
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), "gc ");
+    }
+
+    #[test]
+    fn custom_abbreviator_non_boundary_cursor_offset_declines_expansion() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reedline = Reedline::create().with_abbreviator(Box::new(RecordingAbbreviator {
+            calls,
+            expansion: Some(crate::AbbreviationExpansion {
+                replace_range: 0..2,
+                replacement: "écho".to_string(),
+                cursor: Some(1),
+            }),
+        }));
+        set_buffer_at_end(&mut reedline, "ec");
+
+        reedline.run_edit_commands(&[EditCommand::InsertChar(' ')]);
+
+        assert_eq!(reedline.current_buffer_contents(), "ec ");
     }
 }
